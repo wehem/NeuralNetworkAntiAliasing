@@ -10,6 +10,9 @@ from tkinter import ttk, filedialog, messagebox
 import threading
 import queue
 import os
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+
 import sys
 import traceback
 
@@ -189,7 +192,7 @@ def make_param_row(parent, label_text, var, row, col_offset=0):
 
 
 # ============================================================================
-# Tab: Train
+# Tab: Train (Updated for improved architecture)
 # ============================================================================
 
 class TrainTab(tk.Frame):
@@ -223,15 +226,16 @@ class TrainTab(tk.Frame):
         StyledLabel(params, text="⚙  Hyperparameters", heading=True).grid(
             row=0, column=0, columnspan=6, sticky='w', pady=(0, 4))
 
-        self.lr = tk.StringVar(value='0.00001')
-        self.batch_size = tk.StringVar(value='16')
+        self.lr = tk.StringVar(value='0.0001')  # increased to 1e-4
+        self.batch_size = tk.StringVar(value='8')  # reduced to 8
         self.test_batch = tk.StringVar(value='4')
-        self.epochs_per_run = tk.StringVar(value='5')
+        self.epochs_per_run = tk.StringVar(value='5')  # not used with early stopping (we'll train one epoch at a time)
+        self.patience = tk.StringVar(value='10')  # early stopping patience
 
         make_param_row(params, "Learning Rate:", self.lr, 1, 0)
         make_param_row(params, "Train Batch:", self.batch_size, 1, 2)
         make_param_row(params, "Test Batch:", self.test_batch, 1, 4)
-        make_param_row(params, "Epochs/Run:", self.epochs_per_run, 2, 0)
+        make_param_row(params, "Early Stop Patience:", self.patience, 2, 0)
 
         # ── Model output ──
         model_frame = tk.Frame(self, bg=COLORS['bg'])
@@ -260,7 +264,7 @@ class TrainTab(tk.Frame):
         self.stop_btn = StyledButton(btn_frame, text="■  Stop", danger=True, command=self.stop_training)
         self.stop_btn.pack(side='left')
         self.stop_btn.config(state='disabled')
-        
+
         self.status_label = StyledLabel(btn_frame, text="", dim=True)
         self.status_label.pack(side='right')
 
@@ -268,7 +272,7 @@ class TrainTab(tk.Frame):
         console_frame = tk.Frame(self, bg=COLORS['bg'])
         console_frame.pack(fill='both', expand=True, padx=20, pady=(12, 16))
         StyledLabel(console_frame, text="📋  Training Log", heading=True).pack(anchor='w', pady=(0, 4))
-        
+
         self.console = ConsoleText(console_frame, height=12)
         scrollbar = tk.Scrollbar(console_frame, command=self.console.yview,
                                  bg=COLORS['bg_secondary'], troughcolor=COLORS['console_bg'],
@@ -277,13 +281,12 @@ class TrainTab(tk.Frame):
         scrollbar.pack(side='right', fill='y')
         self.console.pack(fill='both', expand=True)
 
-        self.console.append("Welcome to NNAA Shader Studio!\n", 'accent')
+        self.console.append("Welcome to NNAA Shader Studio (improved architecture)!\n", 'accent')
         self.console.append("Configure your dataset paths and click Start Training.\n")
 
         self._poll_log()
 
     def _poll_log(self):
-        """Pull messages from the log queue and display them."""
         while not self.log_queue.empty():
             msg, tag = self.log_queue.get_nowait()
             self.console.append(msg, tag)
@@ -314,15 +317,18 @@ class TrainTab(tk.Frame):
             import numpy as np
             self.log("OK\n", 'success')
 
+            # Enable mixed precision
+            tf.keras.mixed_precision.set_global_policy('mixed_float16')
+
             # Import the dataset class from nnaa_train
             script_dir = os.path.dirname(os.path.abspath(__file__))
             sys.path.insert(0, script_dir)
-            from nnaa_train import NnaaDataset
+            from nnaa_train import NnaaDataset  # must be updated to return np.half
 
             lr = float(self.lr.get())
             batch_size = int(self.batch_size.get())
             test_batch = int(self.test_batch.get())
-            epochs = int(self.epochs_per_run.get())
+            patience = int(self.patience.get())
             model_name = self.model_name.get()
             models_path = self.model_dir.get()
 
@@ -335,15 +341,56 @@ class TrainTab(tk.Frame):
             model_path = os.path.join(model_directory, model_name) + ".keras"
 
             self.log(f"Model path: {model_path}\n")
-            self.log(f"Learning rate: {lr}\n")
+            self.log(f"Learning rate: {lr} (cosine decay)\n")
             self.log(f"Batch size: {batch_size} (train), {test_batch} (test)\n")
-            self.log(f"Epochs per run: {epochs}\n\n")
+            self.log(f"Early stopping patience: {patience}\n\n")
 
             if not os.path.isdir(model_directory):
                 os.makedirs(model_directory, exist_ok=True)
                 self.log(f"Created directory: {model_directory}\n")
 
-            loss_fn = tf.keras.losses.MeanSquaredError()
+            # Build the improved model (matching the training script)
+            def residual_block(x, filters):
+                shortcut = x
+                x = tf.keras.layers.Conv2D(filters, 3, padding='same')(x)
+                x = tf.keras.layers.BatchNormalization()(x)
+                x = tf.keras.layers.PReLU(shared_axes=[1, 2])(x)
+                x = tf.keras.layers.Conv2D(filters, 3, padding='same')(x)
+                x = tf.keras.layers.BatchNormalization()(x)
+                if shortcut.shape[-1] != filters:
+                    shortcut = tf.keras.layers.Conv2D(filters, 1, padding='same')(shortcut)
+                    shortcut = tf.keras.layers.BatchNormalization()(shortcut)
+                x = tf.keras.layers.Add()([x, shortcut])
+                x = tf.keras.layers.PReLU(shared_axes=[1, 2])(x)
+                return x
+
+            input_img = tf.keras.Input(shape=(None, None, 1), name="img")
+            # detail branch
+            d = tf.keras.layers.Conv2D(32, 3, padding='same')(input_img)
+            d = tf.keras.layers.BatchNormalization()(d)
+            d = tf.keras.layers.PReLU(shared_axes=[1, 2])(d)
+            d = tf.keras.layers.Conv2D(32, 3, padding='same')(d)
+            d = tf.keras.layers.BatchNormalization()(d)
+            d = tf.keras.layers.PReLU(shared_axes=[1, 2])(d)
+            # context branch
+            c = tf.keras.layers.Conv2D(32, 8, strides=2, padding='same')(input_img)
+            c = tf.keras.layers.BatchNormalization()(c)
+            c = tf.keras.layers.PReLU(shared_axes=[1, 2])(c)
+            for _ in range(3):
+                c = residual_block(c, 32)
+            c = tf.keras.layers.UpSampling2D(size=2, interpolation='bilinear')(c)
+            c = tf.keras.layers.Conv2D(32, 3, padding='same')(c)
+            c = tf.keras.layers.BatchNormalization()(c)
+            c = tf.keras.layers.PReLU(shared_axes=[1, 2])(c)
+            # fusion
+            concat = tf.keras.layers.Concatenate()([d, c])
+            x = tf.keras.layers.Conv2D(32, 3, padding='same')(concat)
+            x = tf.keras.layers.BatchNormalization()(x)
+            x = tf.keras.layers.PReLU(shared_axes=[1, 2])(x)
+            x = tf.keras.layers.Conv2D(1, 1, padding='same')(x)
+            output = tf.keras.layers.Activation('linear', dtype='float32')(x)
+
+            loss_fn = tf.keras.losses.MeanAbsoluteError()  # L1 loss
 
             if os.path.isfile(model_path):
                 self.log("Loading existing model... ", None)
@@ -351,25 +398,14 @@ class TrainTab(tk.Frame):
                 self.log("OK\n", 'success')
             else:
                 self.log("Creating new model... ", None)
-                input_layer = tf.keras.Input(shape=(None, None, 1), name="img")
-                x = tf.keras.layers.PReLU(shared_axes=[1, 2])(
-                    tf.keras.layers.Conv2D(32, 8, strides=2, padding='same')(input_layer))
-                x = tf.keras.layers.PReLU(shared_axes=[1, 2])(
-                    tf.keras.layers.Conv2D(32, 3, strides=1, padding='same')(x))
-                x = tf.keras.layers.PReLU(shared_axes=[1, 2])(
-                    tf.keras.layers.Conv2D(32, 3, strides=1, padding='same')(x))
-                x = tf.keras.layers.PReLU(shared_axes=[1, 2])(
-                    tf.keras.layers.Conv2D(32, 3, strides=1, padding='same')(x))
-                output = tf.keras.layers.Conv2DTranspose(1, 2, strides=2, padding='same',
-                                                         name='conv2d_final')(x)
-                model = tf.keras.Model(input_layer, output, name=model_name)
-                model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=lr),
-                              loss=loss_fn, metrics=['mean_squared_error'])
+                model = tf.keras.Model(input_img, output, name=model_name)
+                # Cosine decay schedule
+                decay_steps = 10000  # adjust based on dataset size
+                lr_schedule = tf.keras.optimizers.schedules.CosineDecay(
+                    initial_learning_rate=lr, decay_steps=decay_steps, alpha=1e-6)
+                optimizer = tf.keras.optimizers.Adam(learning_rate=lr_schedule)
+                model.compile(optimizer=optimizer, loss=loss_fn, metrics=['mean_absolute_error'])
                 self.log("OK\n", 'success')
-
-            if model.optimizer.learning_rate != lr:
-                model.optimizer.learning_rate = lr
-                self.log(f"Updated learning rate to {lr}\n", 'warning')
 
             # Model summary
             summary_lines = []
@@ -377,8 +413,8 @@ class TrainTab(tk.Frame):
             self.log('\n'.join(summary_lines) + '\n\n', None)
 
             self.log("Loading dataset... ", None)
-            train_dataset = NnaaDataset(base_dir, target_dir, batch_size, use_cache=True)
-            test_dataset = NnaaDataset(test_base, test_target, test_batch, use_cache=True)
+            train_dataset = NnaaDataset(base_dir, target_dir, batch_size, use_cache=False)
+            test_dataset = NnaaDataset(test_base, test_target, test_batch, use_cache=False)
             self.log(f"OK ({len(train_dataset)} train batches, {len(test_dataset)} test batches)\n", 'success')
 
             best_error = float('inf')
@@ -387,33 +423,41 @@ class TrainTab(tk.Frame):
                 best_error = np.load(best_path).item()
             self.log(f"Best error so far: {best_error}\n\n")
 
-            run = 0
+            no_improve = 0
+            epoch = 0
             while not self.stop_event.is_set():
-                run += 1
-                self.log(f"━━━ Run {run} ━━━\n", 'accent')
+                epoch += 1
+                self.log(f"━━━ Epoch {epoch} ━━━\n", 'accent')
 
-                # Train
-                history = model.fit(train_dataset, epochs=epochs, verbose=0)
-                for epoch_idx, loss_val in enumerate(history.history['loss']):
-                    self.log(f"  Epoch {epoch_idx + 1}/{epochs} — loss: {loss_val:.8f}\n")
+                # Train for one epoch
+                history = model.fit(train_dataset, epochs=1, verbose=0)
+                loss_val = history.history['loss'][0]
+                self.log(f"  Train loss: {loss_val:.8f}\n")
 
                 if self.stop_event.is_set():
                     break
 
                 # Evaluate
                 eval_result = model.evaluate(test_dataset, verbose=0)
-                self.log(f"  Eval — loss: {eval_result[0]:.8f}, mse: {eval_result[1]:.8f}\n")
+                val_loss = eval_result[0]
+                self.log(f"  Val loss: {val_loss:.8f} (best: {best_error:.8f})\n")
 
-                if eval_result[0] < best_error:
-                    best_error = eval_result[0]
+                if val_loss < best_error:
+                    best_error = val_loss
                     np.save(best_path, best_error)
                     model.save(model_path)
-                    self.log(f"  ★ New best! Saved model (error: {best_error:.8f})\n", 'success')
+                    self.log(f"  ★ New best! Saved model\n", 'success')
+                    no_improve = 0
                 else:
-                    self.log(f"  No improvement (best: {best_error:.8f})\n", 'warning')
+                    no_improve += 1
+                    self.log(f"  No improvement for {no_improve} epochs\n", 'warning')
+                    if no_improve >= patience:
+                        self.log(f"  Early stopping triggered after {patience} epochs without improvement.\n",
+                                 'warning')
+                        break
                 self.log('\n')
 
-            self.log("Training stopped.\n", 'accent')
+            self.log("Training finished.\n", 'accent')
 
         except Exception as e:
             self.log(f"\n✗ Error: {e}\n", 'error')
@@ -425,7 +469,6 @@ class TrainTab(tk.Frame):
         self.start_btn.config(state='normal')
         self.stop_btn.config(state='disabled')
         self.status_label.config(text="Idle", fg=COLORS['fg_dim'])
-
 
 # ============================================================================
 # Tab: Convert
@@ -478,85 +521,36 @@ class ConvertTab(tk.Frame):
         threading.Thread(target=self._convert_worker, daemon=True).start()
 
     def _convert_worker(self):
+        import sys
+        import io
+        import contextlib
+        import convert  # the updated convert.py module
+
+        model_path = self.model_path.get()
+        output_path = self.output_path.get()
+
+        if not os.path.isfile(model_path):
+            self.console.append(f"✗ Model file not found: {model_path}\n", 'error')
+            self.after(0, lambda: self.convert_btn.config(state='normal'))
+            return
+
+        # Redirect stdout to capture the conversion log
+        captured_output = io.StringIO()
+        original_argv = sys.argv.copy()
         try:
-            self.console.append("Loading model...\n", 'accent')
-            
-            # Import the converter
-            script_dir = os.path.dirname(os.path.abspath(__file__))
-            sys.path.insert(0, script_dir)
-            import convert
-
-            model_path = self.model_path.get()
-            output_path = self.output_path.get()
-
-            if not os.path.isfile(model_path):
-                self.console.append(f"✗ Model file not found: {model_path}\n", 'error')
-                return
-
-            layers = convert.load_model_weights(model_path)
-
-            self.console.append("Extracted layers:\n")
-            for i, layer in enumerate(layers):
-                shapes = [w.shape for w in layer['weights']]
-                self.console.append(f"  [{i}] {layer['name']} ({layer['type']}): {shapes}\n")
-
-            conv0_kernel, conv0_bias = layers[0]['weights']
-            prelu0_alpha = layers[1]['weights'][0]
-            conv1_kernel, conv1_bias = layers[2]['weights']
-            prelu1_alpha = layers[3]['weights'][0]
-            conv2_kernel, conv2_bias = layers[4]['weights']
-            prelu2_alpha = layers[5]['weights'][0]
-            conv3_kernel, conv3_bias = layers[6]['weights']
-            prelu3_alpha = layers[7]['weights'][0]
-            final_kernel, final_bias = layers[8]['weights']
-
-            self.console.append("\nGenerating shader...\n", 'accent')
-
-            parts = []
-            parts.append(convert.generate_header())
-
-            self.console.append("  Layer conv2d (8x8)... ")
-            parts.append(convert.generate_first_conv_layer(conv0_kernel, conv0_bias, prelu0_alpha))
-            self.console.append("OK\n", 'success')
-
-            self.console.append("  Layer conv2d_1 (3x3)... ")
-            parts.append('\n')
-            parts.append(convert.generate_mid_conv_layer(1, conv1_kernel, conv1_bias, prelu1_alpha))
-            self.console.append("OK\n", 'success')
-
-            self.console.append("  Layer conv2d_2 (3x3)... ")
-            parts.append('\n')
-            parts.append(convert.generate_mid_conv_layer(2, conv2_kernel, conv2_bias, prelu2_alpha))
-            self.console.append("OK\n", 'success')
-
-            self.console.append("  Layer conv2d_3 + final (fused)... ")
-            parts.append('\n')
-            parts.append(convert.generate_mid_conv_layer(3, conv3_kernel, conv3_bias, prelu3_alpha,
-                                                         is_last_hidden=True,
-                                                         final_kernel=final_kernel,
-                                                         final_bias=final_bias))
-            self.console.append("OK\n", 'success')
-
-            parts.append(convert.generate_technique())
-
-            shader_code = '\n'.join(parts)
-            with open(output_path, 'w', encoding='utf-8') as f:
-                f.write(shader_code)
-
-            lines = shader_code.count('\n')
-            size = len(shader_code)
-            self.console.append(f"\n✓ Shader saved to: {output_path}\n", 'success')
-            self.console.append(f"  {size:,} bytes, {lines:,} lines\n", 'success')
+            sys.argv = ['convert.py', model_path, output_path]
+            with contextlib.redirect_stdout(captured_output):
+                convert.main()
+            log_text = captured_output.getvalue()
+            self.console.append(log_text, 'normal')
             self.after(0, lambda: self.status.config(text="Done!", fg=COLORS['success']))
-
         except Exception as e:
             self.console.append(f"\n✗ Error: {e}\n", 'error')
             self.console.append(traceback.format_exc() + '\n', 'error')
             self.after(0, lambda: self.status.config(text="Failed", fg=COLORS['error']))
         finally:
+            sys.argv = original_argv
             self.after(0, lambda: self.convert_btn.config(state='normal'))
-
-
 # ============================================================================
 # Tab: Test
 # ============================================================================
