@@ -1,46 +1,43 @@
 """
-convert.py - Convert a Keras NNAA model (.keras) to a ReShade FX compute shader.
+convert.py - Convert a Keras NNAA model (improved detail‑restoration version) to ReShade FX compute shader.
 
-This script loads the trained neural network anti-aliasing model and generates
-the equivalent HLSL compute shader code that can run in ReShade.
+This script loads the trained model with residual blocks, batch norm folding, and upsampling + conv,
+and generates the equivalent HLSL compute shader code.
 
-The architecture is:
-  Conv2D(32, 8x8, stride=2) + PReLU  ->  Space-to-Depth optimization
-  Conv2D(32, 3x3, stride=1) + PReLU  ->  Standard 3x3 conv
-  Conv2D(32, 3x3, stride=1) + PReLU  ->  Standard 3x3 conv
-  Conv2D(32, 3x3, stride=1) + PReLU  ->  Fused with final layer
-  Conv2DTranspose(1, 2x2, stride=2)  ->  Depth-to-Space (fused above)
+Architecture (after folding BN into conv):
+  - Detail branch: 2x Conv2D(32,3) + PReLU
+  - Context branch: Conv2D(32,8,stride=2) + PReLU
+                   3x residual blocks (each: Conv2D(32,3)+PReLU, Conv2D(32,3)+ skip + PReLU)
+                   UpSampling2D + Conv2D(32,3) + PReLU
+  - Fusion: Concatenate + Conv2D(32,3) + PReLU + Conv2D(1,1) -> residual, then upscale to full-res
 
 Usage:
   python convert.py [model_path] [output_path]
-  python convert.py                          # defaults: nnaa.keras -> out_nnaa.fx
 """
 
 import sys
 import numpy as np
+import tensorflow as tf
 
-def load_model_weights(model_path):
-    """Load Keras model and extract all layer weights in order."""
-    import tensorflow as tf
-    model = tf.keras.models.load_model(model_path)
-    model.summary()
-
-    layers = []
-    for layer in model.layers:
-        weights = layer.get_weights()
-        if len(weights) > 0:
-            layers.append({
-                'name': layer.name,
-                'type': layer.__class__.__name__,
-                'weights': weights
-            })
-    return layers
-
+def fold_batch_norm(conv_weights, conv_bias, bn_weights):
+    """
+    Fold batch normalization into convolution weights.
+    bn_weights = [gamma, beta, moving_mean, moving_variance]
+    Returns (new_weights, new_bias)
+    """
+    gamma, beta, mean, var = bn_weights
+    epsilon = 1e-5  # typical keras default
+    scale = gamma / np.sqrt(var + epsilon)
+    new_weights = conv_weights * scale.reshape(1, 1, 1, -1)
+    if conv_bias is not None:
+        new_bias = beta + scale * (conv_bias - mean)
+    else:
+        new_bias = beta - scale * mean
+    return new_weights, new_bias
 
 def fmt(v):
     """Format a float value as a string, matching the original shader precision."""
     return repr(float(v))
-
 
 def generate_header():
     """Generate the license, includes, defines, and texture/storage declarations."""
@@ -73,6 +70,7 @@ def generate_header():
 
 #define K_SIZE 128
 
+// Half‑res luma (packed 2x2)
 texture2D texLuma_nnaa1
 {
     Width = BUFFER_WIDTH / 2 + 1;
@@ -80,41 +78,81 @@ texture2D texLuma_nnaa1
     MipLevels = 0;
     Format = RGBA16F;
 };
-
 storage2D storageLuma_nnaa1
 {
     Texture = texLuma_nnaa1;
     MipLevel = 0;
 };
 
-texture2D texTarget0_nnaa1
+// Detail branch output (half‑res, 32 channels stored in 8 rows of RGBA)
+texture2D texDetail_nnaa1
 {
     Width = (BUFFER_WIDTH / 2);
     Height = (BUFFER_HEIGHT / 2) * 8;
     MipLevels = 0;
     Format = RGBA16F;
 };
-
-storage2D storageTarget0_nnaa1
+storage2D storageDetail_nnaa1
 {
-    Texture = texTarget0_nnaa1;
+    Texture = texDetail_nnaa1;
     MipLevel = 0;
 };
 
-texture2D texTarget1_nnaa1
+// Context branch intermediate textures (quarter‑res, 32 channels)
+texture2D texContext0_nnaa1
+{
+    Width = (BUFFER_WIDTH / 4);
+    Height = (BUFFER_HEIGHT / 4) * 8;
+    MipLevels = 0;
+    Format = RGBA16F;
+};
+storage2D storageContext0_nnaa1
+{
+    Texture = texContext0_nnaa1;
+    MipLevel = 0;
+};
+
+texture2D texContext1_nnaa1
+{
+    Width = (BUFFER_WIDTH / 4);
+    Height = (BUFFER_HEIGHT / 4) * 8;
+    MipLevels = 0;
+    Format = RGBA16F;
+};
+storage2D storageContext1_nnaa1
+{
+    Texture = texContext1_nnaa1;
+    MipLevel = 0;
+};
+
+texture2D texContext2_nnaa1
+{
+    Width = (BUFFER_WIDTH / 4);
+    Height = (BUFFER_HEIGHT / 4) * 8;
+    MipLevels = 0;
+    Format = RGBA16F;
+};
+storage2D storageContext2_nnaa1
+{
+    Texture = texContext2_nnaa1;
+    MipLevel = 0;
+};
+
+// Upsampled context output (half‑res, 32 channels)
+texture2D texContextUp_nnaa1
 {
     Width = (BUFFER_WIDTH / 2);
     Height = (BUFFER_HEIGHT / 2) * 8;
     MipLevels = 0;
     Format = RGBA16F;
 };
-
-storage2D storageTarget1_nnaa1
+storage2D storageContextUp_nnaa1
 {
-    Texture = texTarget1_nnaa1;
+    Texture = texContextUp_nnaa1;
     MipLevel = 0;
 };
 
+// Final residual (full‑res)
 texture2D texResult_nnaa1
 {
     Width = BUFFER_WIDTH;
@@ -122,7 +160,6 @@ texture2D texResult_nnaa1
     MipLevels = 0;
     Format = R16F;
 };
-
 storage2D storageResult_nnaa1
 {
     Texture = texResult_nnaa1;
@@ -131,7 +168,7 @@ storage2D storageResult_nnaa1
 
 sampler2D samplerResult_nnaa1
 {
-\tTexture = texResult_nnaa1;
+    Texture = texResult_nnaa1;
 };
 
 [shader("compute")]
@@ -141,285 +178,296 @@ void GetLuma(int3 id : SV_DispatchThreadID)
         dot(tex2Dfetch(ReShade::BackBuffer, id.xy * int2(2, 2) + int2(-1, -1)).rgb, min16float3(0.299, 0.587, 0.114)),
         dot(tex2Dfetch(ReShade::BackBuffer, id.xy * int2(2, 2) + int2(0, -1)).rgb, min16float3(0.299, 0.587, 0.114)),
         dot(tex2Dfetch(ReShade::BackBuffer, id.xy * int2(2, 2) + int2(-1, 0)).rgb, min16float3(0.299, 0.587, 0.114)),
-        dot(tex2Dfetch(ReShade::BackBuffer, id.xy * int2(2, 2)).rgb, min16float3(0.299, 0.587, 0.114)));
+        dot(tex2Dfetch(ReShade::BackBuffer, id.xy * int2(2, 2) + int2(0, 0)).rgb, min16float3(0.299, 0.587, 0.114)));
     tex2Dstore(storageLuma_nnaa1, id.xy, luma);
 }
 
 [shader("pixel")]
 float4 ApplyNN(float4 pos : SV_Position) : SV_Target
 {
-\tmin16float luma = tex2Dfetch(samplerResult_nnaa1, pos.xy).r;
-\t
-\tmin16float4 old_color = tex2Dfetch(ReShade::BackBuffer, pos.xy);
-\t
-\tmin16float y = dot(old_color.rgb, min16float3(0.299, 0.587, 0.114)) + luma;
-\tmin16float cb = dot(old_color.rgb, min16float3(-0.1687, -0.3313, 0.5));
-\tmin16float cr = dot(old_color.rgb, min16float3(0.5, -0.4187, -0.0813));
-\t
-\treturn float4(y + 1.402 * cr, y - 0.34414 * cb - 0.71414 * cr, y + 1.772 * cb, old_color.a);
+    min16float luma = tex2Dfetch(samplerResult_nnaa1, pos.xy).r;
+    min16float4 old_color = tex2Dfetch(ReShade::BackBuffer, pos.xy);
+    min16float y = dot(old_color.rgb, min16float3(0.299, 0.587, 0.114)) + luma;
+    min16float cb = dot(old_color.rgb, min16float3(-0.1687, -0.3313, 0.5));
+    min16float cr = dot(old_color.rgb, min16float3(0.5, -0.4187, -0.0813));
+    return float4(y + 1.402 * cr, y - 0.34414 * cb - 0.71414 * cr, y + 1.772 * cb, old_color.a);
 }
 
 """
 
-
-def generate_first_conv_layer(conv_kernel, conv_bias, prelu_alpha):
-    """
-    Generate Layer_conv2d: the first Conv2D(32, 8x8, stride=2) + PReLU.
-    
-    The original 8x8 kernel with stride 2 on a single-channel full-res image
-    is equivalent to a 4x4 kernel with stride 1 on a 4-channel half-res image
-    (Space-to-Depth transformation).
-    
-    The luma texture packs 4 neighboring pixels as RGBA:
-      R = pixel(-1,-1), G = pixel(0,-1), B = pixel(-1,0), A = pixel(0,0)
-    
-    The 8x8 kernel is reshaped: kernel[ky*2+sub_y, kx*2+sub_x, 0, out_ch]
-    maps to offset (kx-1, ky-1) in the luma texture, channel sub_x + sub_y*2
-    (but the luma channels are: R=(-1,-1), G=(0,-1), B=(-1,0), A=(0,0))
-    So sub_channel mapping: (sub_x=0,sub_y=0)->R, (sub_x=1,sub_y=0)->G,
-                             (sub_x=0,sub_y=1)->B, (sub_x=1,sub_y=1)->A
-    Which means sub_channel_index = sub_y * 2 + sub_x maps to xyzw directly.
-    
-    Actually looking at the luma fetch pattern:
-      luma.x = pixel at (id.xy*2 + (-1,-1))  
-      luma.y = pixel at (id.xy*2 + (0,-1))
-      luma.z = pixel at (id.xy*2 + (-1,0))
-      luma.w = pixel at (id.xy*2 + (0,0))
-    
-    And the conv offsets go from (-1,-1) to (2,2) in luma space (4x4 = 16 fetches).
-    Each fetch reads 4 sub-pixels (RGBA). So effectively we cover:
-      full-res x: from (id.x*2 + (-1)*2 + (-1)) to (id.x*2 + 2*2 + 1)
-      = id.x*2 - 3  to  id.x*2 + 5  => 9 positions but kernel is 8, so range is 8.
-    
-    Actually: the 8x8 kernel in TF has shape [ky, kx, 1, 32].
-    With stride=2 on full res: output[oy,ox] = sum over ky=0..7, kx=0..7 of
-      input[oy*2+ky, ox*2+kx] * kernel[ky, kx, 0, :]
-    
-    With the Space-to-Depth packing, luma at (lx, ly) contains:
-      .x = input[ly*2-1, lx*2-1]   (offset -1,-1 relative to the "center" ly*2, lx*2)
-      .y = input[ly*2-1, lx*2]     (offset 0,-1)
-      .z = input[ly*2,   lx*2-1]   (offset -1,0)
-      .w = input[ly*2,   lx*2]     (offset 0,0)
-    
-    The output thread id maps to half-res: oy=id.y, ox=id.x.
-    input[oy*2+ky, ox*2+kx] = luma at position
-      lx = (ox*2+kx+1)//2,  channel depends on (ox*2+kx+1)%2 and (oy*2+ky+1)%2
-    
-    Actually, let me just directly observe what the original does:
-    It fetches luma at id.xy + int2(dx, dy) for dx in {-1,0,1,2}, dy in {-1,0,1,2}.
-    That's 4x4 = 16 fetches. Each fetch is 4 channels (xyzw).
-    So 64 input values total. The 8x8 kernel also has 64 values per output channel.
-    
-    For offset (dx,dy) channel c (0=x,1=y,2=z,3=w):
-      c=0 (.x): pixel at full-res ((id.x+dx)*2-1, (id.y+dy)*2-1)
-      c=1 (.y): pixel at full-res ((id.x+dx)*2,   (id.y+dy)*2-1)
-      c=2 (.z): pixel at full-res ((id.x+dx)*2-1, (id.y+dy)*2)
-      c=3 (.w): pixel at full-res ((id.x+dx)*2,   (id.y+dy)*2)
-    
-    So full-res position relative to id*2:
-      fx = dx*2 + (1 if c in {1,3} else -1) = dx*2 + (c%2)*2 - 1  => wait:
-      c=0: fx = dx*2-1, fy = dy*2-1
-      c=1: fx = dx*2,   fy = dy*2-1
-      c=2: fx = dx*2-1, fy = dy*2
-      c=3: fx = dx*2,   fy = dy*2
-    
-    Relative to output center (id.x*2, id.y*2), the full-res input coordinate is:
-      kx = fx = dx*2 + (c%2==1 ? 0 : -1)
-      ky = fy = dy*2 + (c//2==1 ? 0 : -1)
-    
-    Wait, let me simplify. We have kx = dx*2 - 1 + (c % 2), ky = dy*2 - 1 + (c // 2).
-    
-    The TF conv2d with stride 2: output[id.y, id.x] = sum_{ky=0..7, kx=0..7} 
-      input[id.y*2 + ky - pad, id.x*2 + kx - pad] * kernel[ky, kx, 0, out_ch]
-    With padding='same' and stride=2, pad = (kernel_size - 1) / 2 = 3.5, 
-    but TF uses asymmetric padding for even kernels. For 'same' with stride s:
-      out_size = ceil(in_size / s)
-      pad_total = max(0, (out_size - 1) * s + kernel_size - in_size)
-      pad_before = pad_total // 2
-    For stride=2, kernel=8: pad_total = 6, pad_before = 3.
-    
-    So: output[oy, ox] = sum_{ky=0..7, kx=0..7}
-      input[oy*2 + ky - 3, ox*2 + kx - 3] * kernel[ky, kx, 0, out_ch]
-    
-    Now matching: the fetch at luma offset (dx, dy) channel c gives us 
-      input at (id.x*2 + dx*2 - 1 + c%2, id.y*2 + dy*2 - 1 + c//2)
-    
-    For this to equal input[id.y*2 + ky - 3, id.x*2 + kx - 3]:
-      kx - 3 = dx*2 - 1 + (c % 2)  =>  kx = dx*2 + 2 + (c % 2)
-      ky - 3 = dy*2 - 1 + (c // 2)  =>  ky = dy*2 + 2 + (c // 2)
-    
-    With dx in {-1,0,1,2}: kx ranges from 0+c%2 to 6+c%2. 
-    With c%2 in {0,1}: kx ranges from 0 to 7. ✓
-    Same for ky.
-    
-    So: kernel_index for fetch (dx, dy, c) is:
-      kx = dx*2 + 2 + (c % 2)
-      ky = dy*2 + 2 + (c // 2)
-      weight = kernel[ky, kx, 0, out_ch]
-    """
+def generate_detail_conv_1(conv_weights, conv_bias, prelu_alpha):
+    """First detail conv (3x3, stride=1, half‑res luma) -> 32 channels."""
     lines = []
     lines.append('[shader("compute")]')
-    lines.append('void Layer_conv2d(int3 id : SV_DispatchThreadID)')
+    lines.append('void Layer_detail_1(int3 id : SV_DispatchThreadID)')
     lines.append('{')
     lines.append('    if(id.x >= (BUFFER_WIDTH / 2)) return;')
-
-    num_out = conv_bias.shape[0]  # 32
-    num_groups = num_out // 4  # 8 groups of 4 channels
-
-    # Initialize f_out with biases
+    num_out = 32
+    num_groups = 8
     for g in range(num_groups):
         b = conv_bias[g*4:(g+1)*4]
         lines.append(f'    min16float4 f_out_{g} = min16float4({fmt(b[0])},{fmt(b[1])},{fmt(b[2])},{fmt(b[3])});')
-    
     lines.append('    min16float4 f_in;')
-
-    # Iterate over 4x4 spatial neighborhood in luma space
-    for dy in range(-1, 3):
-        for dx in range(-1, 3):
-            lines.append(f'    f_in = tex2Dfetch(storageLuma_nnaa1, id.xy + int2({float(dx)}, {float(dy)}));')
-            
-            # For each input channel c (0=x, 1=y, 2=z, 3=w)
-            for c in range(4):
-                kx = dx * 2 + 2 + (c % 2)
-                ky = dy * 2 + 2 + (c // 2)
-                
-                channel_name = ['x', 'y', 'z', 'w'][c]
-                
-                # For each output group of 4
-                for g in range(num_groups):
-                    w = conv_kernel[ky, kx, 0, g*4:(g+1)*4]
-                    lines.append(f'    f_out_{g} += min16float4({fmt(w[0])},{fmt(w[1])},{fmt(w[2])},{fmt(w[3])}) * f_in.{channel_name};')
-
-    # PReLU activation + store
-    # prelu_alpha shape is (1, 1, 32)
-    alpha = prelu_alpha.reshape(-1)
-    for g in range(num_groups):
-        for c_idx, c_name in enumerate(['x', 'y', 'z', 'w']):
-            ch = g * 4 + c_idx
-            lines.append(f'    if(f_out_{g}.{c_name} < 0)')
-            lines.append(f'        f_out_{g}.{c_name} *= {fmt(alpha[ch])};')
-        lines.append(f'    tex2Dstore(storageTarget0_nnaa1, id.xy * int2(1, 8) + int2(0, {g}), f_out_{g});')
-
-    lines.append('}')
-    return '\n'.join(lines)
-
-
-def generate_mid_conv_layer(layer_index, conv_kernel, conv_bias, prelu_alpha, 
-                            is_last_hidden=False, final_kernel=None, final_bias=None):
-    """
-    Generate a middle Conv2D(32, 3x3, stride=1) + PReLU layer.
-    
-    For 3x3 convolution on 32 channels stored in 8 rows of RGBA:
-    - Input is read from one storage texture, output written to the other (ping-pong)
-    - Each spatial offset (dx, dy) in {-1,0,1} maps to reading 8 rows of 4 channels
-    - So 3x3 spatial * 8 rows = 72 fetches, each with 4 channel multiplies
-    
-    For the last hidden layer (conv2d_3), we fuse the Conv2DTranspose output layer
-    directly after the PReLU, producing 4 output pixels in Depth-to-Space fashion.
-    """
-    # Determine ping-pong: even layer_index reads from Target0, writes to Target1
-    # layer_index: 1 = conv2d_1, 2 = conv2d_2, 3 = conv2d_3
-    if layer_index % 2 == 1:
-        src_storage = 'storageTarget0_nnaa1'
-        dst_storage = 'storageTarget1_nnaa1'
-    else:
-        src_storage = 'storageTarget1_nnaa1'
-        dst_storage = 'storageTarget0_nnaa1'
-
-    func_name = f'Layer_conv2d_{layer_index}'
-    
-    lines = []
-    lines.append(f'[shader("compute")]')
-    lines.append(f'void {func_name}(int3 id : SV_DispatchThreadID)')
-    lines.append('{')
-    lines.append('    if(id.x >= (BUFFER_WIDTH / 2)) return;')
-
-    num_out = conv_bias.shape[0]  # 32
-    num_groups = num_out // 4  # 8
-
-    # Initialize f_out with biases
-    for g in range(num_groups):
-        b = conv_bias[g*4:(g+1)*4]
-        lines.append(f'    min16float4 f_out_{g} = min16float4({fmt(b[0])},{fmt(b[1])},{fmt(b[2])},{fmt(b[3])});')
-    
-    lines.append('    min16float4 f_in;')
-
-    # 3x3 spatial convolution over 32 input channels (8 groups of 4)
-    # conv_kernel shape: (3, 3, 32, 32)
     for dy in range(-1, 2):
         for dx in range(-1, 2):
-            for in_g in range(num_groups):  # input group (0..7)
-                row_offset = dy * 8 + in_g
-                lines.append(f'    f_in = tex2Dfetch({src_storage}, id.xy * int2(1, 8) + int2({float(dx)}, {float(row_offset)}));')
-                
-                # For each input sub-channel c (0=x, 1=y, 2=z, 3=w)
-                for c in range(4):
-                    in_ch = in_g * 4 + c
-                    ky = dy + 1  # kernel index: 0,1,2
-                    kx = dx + 1
-                    
-                    channel_name = ['x', 'y', 'z', 'w'][c]
-                    
-                    # For each output group
-                    for out_g in range(num_groups):
-                        w = conv_kernel[ky, kx, in_ch, out_g*4:(out_g+1)*4]
-                        lines.append(f'    f_out_{out_g} += min16float4({fmt(w[0])},{fmt(w[1])},{fmt(w[2])},{fmt(w[3])}) * f_in.{channel_name};')
-
-    # PReLU activation
+            lines.append(f'    f_in = tex2Dfetch(storageLuma_nnaa1, id.xy + int2({dx}, {dy}));')
+            for c in range(4):
+                channel_name = ['x', 'y', 'z', 'w'][c]
+                in_ch = c
+                ky = dy + 1
+                kx = dx + 1
+                for out_g in range(num_groups):
+                    w = conv_weights[ky, kx, in_ch, out_g*4:(out_g+1)*4]
+                    lines.append(f'    f_out_{out_g} += min16float4({fmt(w[0])},{fmt(w[1])},{fmt(w[2])},{fmt(w[3])}) * f_in.{channel_name};')
     alpha = prelu_alpha.reshape(-1)
+    # store to temporary texture? Actually we need to keep intermediate for second detail conv.
+    # We'll store to an intermediate texture (half‑res, 32 channels) but we already have storageDetail_nnaa1.
+    # We'll use storageDetail_nnaa1 for the output of the first detail conv? The second detail conv will read from there.
+    # Let's store to storageDetail_nnaa1 after first conv, then second conv reads from it and writes back to same texture? That would require ping-pong.
+    # Simpler: use two separate textures: storageDetail0_nnaa1 and storageDetail1_nnaa1.
+    # But to keep texture count minimal, we can store first conv output in storageDetail_nnaa1, then second conv reads from it and writes to storageDetail_nnaa1 (overwrites). That's fine because we don't need the first after second.
     for g in range(num_groups):
         for c_idx, c_name in enumerate(['x', 'y', 'z', 'w']):
-            ch = g * 4 + c_idx
-            lines.append(f'    if(f_out_{g}.{c_name} < 0)')
-            lines.append(f'        f_out_{g}.{c_name} *= {fmt(alpha[ch])};')
-
-    if is_last_hidden and final_kernel is not None:
-        # Fuse the Conv2DTranspose(1, 2x2, stride=2) as a Depth-to-Space
-        # final_kernel shape: (2, 2, 1, 32) for Conv2DTranspose
-        # final_bias shape: (1,)
-        # 
-        # Conv2DTranspose with stride=2 and kernel 2x2 maps each input pixel to
-        # a 2x2 output block. The kernel maps:
-        #   output[oy*2+0, ox*2+0] += sum_c input[oy, ox, c] * kernel[0, 0, 0, c]
-        #   output[oy*2+1, ox*2+0] += sum_c input[oy, ox, c] * kernel[1, 0, 0, c]
-        #   output[oy*2+0, ox*2+1] += sum_c input[oy, ox, c] * kernel[0, 1, 0, c]
-        #   output[oy*2+1, ox*2+1] += sum_c input[oy, ox, c] * kernel[1, 1, 0, c]
-        #
-        # So f_out.x = pixel(0,0), f_out.y = pixel(1,0), f_out.z = pixel(0,1), f_out.w = pixel(1,1)
-        # This means xyzw map to:
-        #   x -> (0,0) -> kernel[0,0,0,:]
-        #   y -> (1,0) -> kernel[0,1,0,:]
-        #   z -> (0,1) -> kernel[1,0,0,:]
-        #   w -> (1,1) -> kernel[1,1,0,:]
-        
-        fb = float(final_bias[0])
-        lines.append(f'')
-        lines.append(f'    min16float4 f_out = min16float4({fmt(fb)},{fmt(fb)},{fmt(fb)},{fmt(fb)});')
-        
-        for g in range(num_groups):
-            lines.append(f'    f_in = f_out_{g};')
-            for c in range(4):
-                in_ch = g * 4 + c
-                c_name = ['x', 'y', 'z', 'w'][c]
-                # Output mapping: x->(0,0), y->(1,0), z->(0,1), w->(1,1)
-                w_x = float(final_kernel[0, 0, 0, in_ch])
-                w_y = float(final_kernel[0, 1, 0, in_ch])
-                w_z = float(final_kernel[1, 0, 0, in_ch])
-                w_w = float(final_kernel[1, 1, 0, in_ch])
-                lines.append(f'    f_out += min16float4({fmt(w_x)},{fmt(w_y)},{fmt(w_z)},{fmt(w_w)}) * f_in.{c_name};')
-
-        lines.append(f'    tex2Dstore(storageResult_nnaa1, (id.xy * 2) + uint2(0, 0), f_out.x);')
-        lines.append(f'    tex2Dstore(storageResult_nnaa1, (id.xy * 2) + uint2(1, 0), f_out.y);')
-        lines.append(f'    tex2Dstore(storageResult_nnaa1, (id.xy * 2) + uint2(0, 1), f_out.z);')
-        lines.append(f'    tex2Dstore(storageResult_nnaa1, (id.xy * 2) + uint2(1, 1), f_out.w);')
-    else:
-        # Store to destination texture
-        for g in range(num_groups):
-            lines.append(f'    tex2Dstore({dst_storage}, id.xy * int2(1, 8) + int2(0, {g}), f_out_{g});')
-
+            ch = g*4 + c_idx
+            lines.append(f'    if(f_out_{g}.{c_name} < 0) f_out_{g}.{c_name} *= {fmt(alpha[ch])};')
+        lines.append(f'    tex2Dstore(storageDetail_nnaa1, id.xy * int2(1, 8) + int2(0, {g}), f_out_{g});')
     lines.append('}')
     return '\n'.join(lines)
 
+def generate_detail_conv_2(conv_weights, conv_bias, prelu_alpha):
+    """Second detail conv (3x3, stride=1) reading from storageDetail_nnaa1 (32ch) -> 32ch."""
+    lines = []
+    lines.append('[shader("compute")]')
+    lines.append('void Layer_detail_2(int3 id : SV_DispatchThreadID)')
+    lines.append('{')
+    lines.append('    if(id.x >= (BUFFER_WIDTH / 2)) return;')
+    num_out = 32
+    num_groups = 8
+    for g in range(num_groups):
+        b = conv_bias[g*4:(g+1)*4]
+        lines.append(f'    min16float4 f_out_{g} = min16float4({fmt(b[0])},{fmt(b[1])},{fmt(b[2])},{fmt(b[3])});')
+    lines.append('    min16float4 f_in;')
+    for dy in range(-1, 2):
+        for dx in range(-1, 2):
+            for in_g in range(num_groups):
+                lines.append(f'    f_in = tex2Dfetch(storageDetail_nnaa1, id.xy * int2(1, 8) + int2({dx}, {in_g}));')
+                for c in range(4):
+                    channel_name = ['x', 'y', 'z', 'w'][c]
+                    in_ch = in_g*4 + c
+                    ky = dy + 1
+                    kx = dx + 1
+                    for out_g in range(num_groups):
+                        w = conv_weights[ky, kx, in_ch, out_g*4:(out_g+1)*4]
+                        lines.append(f'    f_out_{out_g} += min16float4({fmt(w[0])},{fmt(w[1])},{fmt(w[2])},{fmt(w[3])}) * f_in.{channel_name};')
+    alpha = prelu_alpha.reshape(-1)
+    for g in range(num_groups):
+        for c_idx, c_name in enumerate(['x', 'y', 'z', 'w']):
+            ch = g*4 + c_idx
+            lines.append(f'    if(f_out_{g}.{c_name} < 0) f_out_{g}.{c_name} *= {fmt(alpha[ch])};')
+        lines.append(f'    tex2Dstore(storageDetail_nnaa1, id.xy * int2(1, 8) + int2(0, {g}), f_out_{g});')
+    lines.append('}')
+    return '\n'.join(lines)
+
+def generate_context_conv0(conv_weights, conv_bias, prelu_alpha):
+    """Context branch first conv (8x8, stride=2) from half‑res luma to quarter‑res 32ch."""
+    lines = []
+    lines.append('[shader("compute")]')
+    lines.append('void Layer_context0(int3 id : SV_DispatchThreadID)')
+    lines.append('{')
+    lines.append('    if(id.x >= (BUFFER_WIDTH / 4)) return;')
+    num_out = 32
+    num_groups = 8
+    for g in range(num_groups):
+        b = conv_bias[g*4:(g+1)*4]
+        lines.append(f'    min16float4 f_out_{g} = min16float4({fmt(b[0])},{fmt(b[1])},{fmt(b[2])},{fmt(b[3])});')
+    lines.append('    min16float4 f_in;')
+    for dy in range(-1, 3):
+        for dx in range(-1, 3):
+            lines.append(f'    f_in = tex2Dfetch(storageLuma_nnaa1, id.xy + int2({dx}, {dy}));')
+            for c in range(4):
+                channel_name = ['x', 'y', 'z', 'w'][c]
+                kx = dx*2 + 2 + (c % 2)
+                ky = dy*2 + 2 + (c // 2)
+                for out_g in range(num_groups):
+                    w = conv_weights[ky, kx, 0, out_g*4:(out_g+1)*4]
+                    lines.append(f'    f_out_{out_g} += min16float4({fmt(w[0])},{fmt(w[1])},{fmt(w[2])},{fmt(w[3])}) * f_in.{channel_name};')
+    alpha = prelu_alpha.reshape(-1)
+    for g in range(num_groups):
+        for c_idx, c_name in enumerate(['x', 'y', 'z', 'w']):
+            ch = g*4 + c_idx
+            lines.append(f'    if(f_out_{g}.{c_name} < 0) f_out_{g}.{c_name} *= {fmt(alpha[ch])};')
+        lines.append(f'    tex2Dstore(storageContext0_nnaa1, id.xy * int2(1, 8) + int2(0, {g}), f_out_{g});')
+    lines.append('}')
+    return '\n'.join(lines)
+
+def generate_residual_block(block_idx, conv1_weights, conv1_bias, prelu1_alpha,
+                            conv2_weights, conv2_bias, prelu2_alpha,
+                            src_storage, dst_storage):
+    """Generate a compute shader for one residual block (two convs + skip addition)."""
+    lines = []
+    lines.append(f'[shader("compute")]')
+    lines.append(f'void Layer_resblock_{block_idx}(int3 id : SV_DispatchThreadID)')
+    lines.append('{')
+    lines.append('    if(id.x >= (BUFFER_WIDTH / 4)) return;')
+    num_groups = 8
+    # first conv
+    for g in range(num_groups):
+        b = conv1_bias[g*4:(g+1)*4]
+        lines.append(f'    min16float4 f1_out_{g} = min16float4({fmt(b[0])},{fmt(b[1])},{fmt(b[2])},{fmt(b[3])});')
+    lines.append('    min16float4 f_in;')
+    # 3x3 conv1
+    for dy in range(-1, 2):
+        for dx in range(-1, 2):
+            for in_g in range(num_groups):
+                lines.append(f'    f_in = tex2Dfetch({src_storage}, id.xy * int2(1, 8) + int2({dx}, {in_g}));')
+                for c in range(4):
+                    channel_name = ['x', 'y', 'z', 'w'][c]
+                    in_ch = in_g*4 + c
+                    ky = dy + 1
+                    kx = dx + 1
+                    for out_g in range(num_groups):
+                        w = conv1_weights[ky, kx, in_ch, out_g*4:(out_g+1)*4]
+                        lines.append(f'    f1_out_{out_g} += min16float4({fmt(w[0])},{fmt(w[1])},{fmt(w[2])},{fmt(w[3])}) * f_in.{channel_name};')
+    # prelu1
+    alpha1 = prelu1_alpha.reshape(-1)
+    for g in range(num_groups):
+        for c_idx, c_name in enumerate(['x', 'y', 'z', 'w']):
+            ch = g*4 + c_idx
+            lines.append(f'    if(f1_out_{g}.{c_name} < 0) f1_out_{g}.{c_name} *= {fmt(alpha1[ch])};')
+    # second conv
+    for g in range(num_groups):
+        b = conv2_bias[g*4:(g+1)*4]
+        lines.append(f'    min16float4 f2_out_{g} = min16float4({fmt(b[0])},{fmt(b[1])},{fmt(b[2])},{fmt(b[3])});')
+    # 3x3 conv2
+    for dy in range(-1, 2):
+        for dx in range(-1, 2):
+            for in_g in range(num_groups):
+                lines.append(f'    f_in = f1_out_{in_g};')
+                for c in range(4):
+                    channel_name = ['x', 'y', 'z', 'w'][c]
+                    in_ch = in_g*4 + c
+                    ky = dy + 1
+                    kx = dx + 1
+                    for out_g in range(num_groups):
+                        w = conv2_weights[ky, kx, in_ch, out_g*4:(out_g+1)*4]
+                        lines.append(f'    f2_out_{out_g} += min16float4({fmt(w[0])},{fmt(w[1])},{fmt(w[2])},{fmt(w[3])}) * f1_out_{in_g}.{channel_name};')
+    # add skip (input texture)
+    for g in range(num_groups):
+        lines.append(f'    f_in = tex2Dfetch({src_storage}, id.xy * int2(1, 8) + int2(0, {g}));')
+        lines.append(f'    f2_out_{g} += f_in;')
+    # prelu2
+    alpha2 = prelu2_alpha.reshape(-1)
+    for g in range(num_groups):
+        for c_idx, c_name in enumerate(['x', 'y', 'z', 'w']):
+            ch = g*4 + c_idx
+            lines.append(f'    if(f2_out_{g}.{c_name} < 0) f2_out_{g}.{c_name} *= {fmt(alpha2[ch])};')
+        lines.append(f'    tex2Dstore({dst_storage}, id.xy * int2(1, 8) + int2(0, {g}), f2_out_{g});')
+    lines.append('}')
+    return '\n'.join(lines)
+
+def generate_upsample_conv(conv_weights, conv_bias, prelu_alpha):
+    """Upsample + 3x3 conv: from quarter‑res (storageContext2_nnaa1) to half‑res (storageContextUp_nnaa1)."""
+    lines = []
+    lines.append('[shader("compute")]')
+    lines.append('void Layer_upsample_conv(int3 id : SV_DispatchThreadID)')
+    lines.append('{')
+    lines.append('    if(id.x >= (BUFFER_WIDTH / 2)) return;')
+    num_groups = 8
+    for g in range(num_groups):
+        b = conv_bias[g*4:(g+1)*4]
+        lines.append(f'    min16float4 f_out_{g} = min16float4({fmt(b[0])},{fmt(b[1])},{fmt(b[2])},{fmt(b[3])});')
+    lines.append('    min16float4 f_in;')
+    # nearest neighbor upsampling: each half‑res pixel corresponds to a quarter‑res pixel at (id.xy // 2)
+    lines.append('    uint2 qcoord = id.xy / 2;')
+    # fetch 3x3 neighborhood from quarter‑res
+    for dy in range(-1, 2):
+        for dx in range(-1, 2):
+            lines.append(f'    uint2 c = qcoord + int2({dx}, {dy});')
+            lines.append('    if(c.x < (BUFFER_WIDTH / 4) && c.y < (BUFFER_HEIGHT / 4)) {')
+            for in_g in range(num_groups):
+                lines.append(f'        f_in = tex2Dfetch(storageContext2_nnaa1, c * int2(1, 8) + int2(0, {in_g}));')
+                for c_idx in range(4):
+                    channel_name = ['x', 'y', 'z', 'w'][c_idx]
+                    in_ch = in_g*4 + c_idx
+                    ky = dy + 1
+                    kx = dx + 1
+                    for out_g in range(num_groups):
+                        w = conv_weights[ky, kx, in_ch, out_g*4:(out_g+1)*4]
+                        lines.append(f'        f_out_{out_g} += min16float4({fmt(w[0])},{fmt(w[1])},{fmt(w[2])},{fmt(w[3])}) * f_in.{channel_name};')
+            lines.append('    }')
+    # prelu
+    alpha = prelu_alpha.reshape(-1)
+    for g in range(num_groups):
+        for c_idx, c_name in enumerate(['x', 'y', 'z', 'w']):
+            ch = g*4 + c_idx
+            lines.append(f'    if(f_out_{g}.{c_name} < 0) f_out_{g}.{c_name} *= {fmt(alpha[ch])};')
+        lines.append(f'    tex2Dstore(storageContextUp_nnaa1, id.xy * int2(1, 8) + int2(0, {g}), f_out_{g});')
+    lines.append('}')
+    return '\n'.join(lines)
+
+def generate_fusion(conv3_weights, conv3_bias, prelu3_alpha, final_conv_weights, final_conv_bias):
+    """Fusion: read detail (storageDetail_nnaa1) and context up (storageContextUp_nnaa1), apply 3x3 conv, then 1x1 conv, then upscale to full-res."""
+    lines = []
+    lines.append('[shader("compute")]')
+    lines.append('void Layer_fusion(int3 id : SV_DispatchThreadID)')
+    lines.append('{')
+    lines.append('    if(id.x >= (BUFFER_WIDTH / 2)) return;')
+    num_groups = 8
+    # First 3x3 conv (32 output channels)
+    for g in range(num_groups):
+        b = conv3_bias[g*4:(g+1)*4]
+        lines.append(f'    min16float4 f3_out_{g} = min16float4({fmt(b[0])},{fmt(b[1])},{fmt(b[2])},{fmt(b[3])});')
+    lines.append('    min16float4 f_in;')
+    # 3x3 convolution on concatenated input (64 channels: 32 from detail, 32 from context up)
+    # For each spatial offset, we need to fetch both detail and context up.
+    for dy in range(-1, 2):
+        for dx in range(-1, 2):
+            # detail part (channels 0-31)
+            for in_g in range(num_groups):
+                lines.append(f'    f_in = tex2Dfetch(storageDetail_nnaa1, id.xy * int2(1, 8) + int2({dx}, {in_g}));')
+                for c_idx in range(4):
+                    channel_name = ['x', 'y', 'z', 'w'][c_idx]
+                    in_ch = in_g*4 + c_idx
+                    ky = dy + 1
+                    kx = dx + 1
+                    for out_g in range(num_groups):
+                        w = conv3_weights[ky, kx, in_ch, out_g*4:(out_g+1)*4]
+                        lines.append(f'    f3_out_{out_g} += min16float4({fmt(w[0])},{fmt(w[1])},{fmt(w[2])},{fmt(w[3])}) * f_in.{channel_name};')
+            # context up part (channels 32-63)
+            for in_g in range(num_groups):
+                lines.append(f'    f_in = tex2Dfetch(storageContextUp_nnaa1, id.xy * int2(1, 8) + int2({dx}, {in_g}));')
+                for c_idx in range(4):
+                    channel_name = ['x', 'y', 'z', 'w'][c_idx]
+                    in_ch = 32 + in_g*4 + c_idx
+                    ky = dy + 1
+                    kx = dx + 1
+                    for out_g in range(num_groups):
+                        w = conv3_weights[ky, kx, in_ch, out_g*4:(out_g+1)*4]
+                        lines.append(f'    f3_out_{out_g} += min16float4({fmt(w[0])},{fmt(w[1])},{fmt(w[2])},{fmt(w[3])}) * f_in.{channel_name};')
+    # prelu
+    alpha3 = prelu3_alpha.reshape(-1)
+    for g in range(num_groups):
+        for c_idx, c_name in enumerate(['x', 'y', 'z', 'w']):
+            ch = g*4 + c_idx
+            lines.append(f'    if(f3_out_{g}.{c_name} < 0) f3_out_{g}.{c_name} *= {fmt(alpha3[ch])};')
+    # 1x1 conv (output 1 channel)
+    # bias is scalar
+    fb = float(final_conv_bias[0])
+    lines.append(f'    min16float4 result = min16float4({fmt(fb)},{fmt(fb)},{fmt(fb)},{fmt(fb)});')
+    for in_g in range(num_groups):
+        lines.append(f'    f_in = f3_out_{in_g};')
+        for c_idx in range(4):
+            in_ch = in_g*4 + c_idx
+            w = final_conv_weights[0, 0, in_ch, 0]
+            lines.append(f'    result += min16float4({fmt(w)}) * f_in.{["x","y","z","w"][c_idx]};')
+    # upscale to full-res (nearest neighbor)
+    lines.append('    min16float val = result.x;')
+    lines.append('    tex2Dstore(storageResult_nnaa1, id.xy * 2 + uint2(0,0), val);')
+    lines.append('    tex2Dstore(storageResult_nnaa1, id.xy * 2 + uint2(1,0), val);')
+    lines.append('    tex2Dstore(storageResult_nnaa1, id.xy * 2 + uint2(0,1), val);')
+    lines.append('    tex2Dstore(storageResult_nnaa1, id.xy * 2 + uint2(1,1), val);')
+    lines.append('}')
+    return '\n'.join(lines)
 
 def generate_technique():
     """Generate the technique block that dispatches all passes."""
@@ -432,121 +480,174 @@ def generate_technique():
 #endif
 
 #define Y_DISPATCH (BUFFER_HEIGHT / 2)
+#define QX_DISPATCH (BUFFER_WIDTH / (4 * K_SIZE) + 1)
+#define QY_DISPATCH (BUFFER_HEIGHT / 4)
 
-
-technique Sarenya_NNAA < ui_tooltip = "Sar\\xe9nya NNAA"; >
+technique Sarenya_NNAA < ui_tooltip = "Sar\\xe9nya NNAA (detail restoration)"; >
 {
     pass luma
     {
         ComputeShader = GetLuma<16, 16>;
-
         DispatchSizeX = BUFFER_WIDTH / (2 * 16) + 1;
         DispatchSizeY = BUFFER_HEIGHT / (2 * 16) + 1;
     }
 
-
-    pass pass_conv2d
+    pass detail1
     {
-        ComputeShader = Layer_conv2d<K_SIZE, 1>;
-
+        ComputeShader = Layer_detail_1<K_SIZE, 1>;
         DispatchSizeX = X_DISPATCH;
         DispatchSizeY = Y_DISPATCH;
     }
 
-    pass pass_conv2d_1
+    pass detail2
     {
-        ComputeShader = Layer_conv2d_1<K_SIZE, 1>;
-
+        ComputeShader = Layer_detail_2<K_SIZE, 1>;
         DispatchSizeX = X_DISPATCH;
         DispatchSizeY = Y_DISPATCH;
     }
 
-    pass pass_conv2d_2
+    pass context0
     {
-        ComputeShader = Layer_conv2d_2<K_SIZE, 1>;
+        ComputeShader = Layer_context0<K_SIZE, 1>;
+        DispatchSizeX = QX_DISPATCH;
+        DispatchSizeY = QY_DISPATCH;
+    }
 
+    pass resblock1
+    {
+        ComputeShader = Layer_resblock_1<K_SIZE, 1>;
+        DispatchSizeX = QX_DISPATCH;
+        DispatchSizeY = QY_DISPATCH;
+    }
+
+    pass resblock2
+    {
+        ComputeShader = Layer_resblock_2<K_SIZE, 1>;
+        DispatchSizeX = QX_DISPATCH;
+        DispatchSizeY = QY_DISPATCH;
+    }
+
+    pass resblock3
+    {
+        ComputeShader = Layer_resblock_3<K_SIZE, 1>;
+        DispatchSizeX = QX_DISPATCH;
+        DispatchSizeY = QY_DISPATCH;
+    }
+
+    pass upsample_conv
+    {
+        ComputeShader = Layer_upsample_conv<K_SIZE, 1>;
         DispatchSizeX = X_DISPATCH;
         DispatchSizeY = Y_DISPATCH;
     }
 
-    pass pass_conv2d_3
+    pass fusion
     {
-        ComputeShader = Layer_conv2d_3<K_SIZE, 1>;
-
+        ComputeShader = Layer_fusion<K_SIZE, 1>;
         DispatchSizeX = X_DISPATCH;
         DispatchSizeY = Y_DISPATCH;
     }
 
     pass apply_nn
-\t{
-\t\tVertexShader = PostProcessVS;
-\t\tPixelShader = ApplyNN;
-\t}
+    {
+        VertexShader = PostProcessVS;
+        PixelShader = ApplyNN;
+    }
 }
 """
-
 
 def main():
     model_path = sys.argv[1] if len(sys.argv) > 1 else 'nnaa.keras'
     output_path = sys.argv[2] if len(sys.argv) > 2 else 'out_nnaa.fx'
 
     print(f"Loading model from: {model_path}")
-    layers = load_model_weights(model_path)
+    model = tf.keras.models.load_model(model_path)
+    model.summary()
 
-    # Print layer info
-    print("\nExtracted layers:")
-    for i, layer in enumerate(layers):
-        shapes = [w.shape for w in layer['weights']]
-        print(f"  [{i}] {layer['name']} ({layer['type']}): {shapes}")
+    # Walk through layers, fold BN into Conv2D
+    layers = model.layers
+    ops = []
+    i = 0
+    while i < len(layers):
+        layer = layers[i]
+        if isinstance(layer, tf.keras.layers.Conv2D):
+            weights = layer.get_weights()  # [kernel, bias]
+            if i+1 < len(layers) and isinstance(layers[i+1], tf.keras.layers.BatchNormalization):
+                bn_weights = layers[i+1].get_weights()
+                new_w, new_b = fold_batch_norm(weights[0], weights[1], bn_weights)
+                ops.append(('conv', new_w, new_b))
+                i += 2
+            else:
+                ops.append(('conv', weights[0], weights[1]))
+                i += 1
+        elif isinstance(layer, tf.keras.layers.PReLU):
+            alpha = layer.get_weights()[0]
+            ops.append(('prelu', alpha))
+            i += 1
+        elif isinstance(layer, (tf.keras.layers.Add, tf.keras.layers.Concatenate,
+                                 tf.keras.layers.UpSampling2D, tf.keras.layers.Activation)):
+            i += 1
+        else:
+            i += 1
 
-    # Map layers by their roles:
-    # 0: conv2d        -> kernel (8,8,1,32), bias (32,)
-    # 1: p_re_lu       -> alpha (1,1,32)
-    # 2: conv2d_1      -> kernel (3,3,32,32), bias (32,)
-    # 3: p_re_lu_1     -> alpha (1,1,32)
-    # 4: conv2d_2      -> kernel (3,3,32,32), bias (32,)
-    # 5: p_re_lu_2     -> alpha (1,1,32)
-    # 6: conv2d_3      -> kernel (3,3,32,32), bias (32,)
-    # 7: p_re_lu_3     -> alpha (1,1,32)
-    # 8: conv2d_final  -> kernel (2,2,1,32), bias (1,)
+    # Extract operations in expected order (from the training script)
+    # Architecture: detail_conv1, prelu, detail_conv2, prelu, context0_conv, prelu,
+    # then 3 residual blocks (each: conv, prelu, conv, prelu), then upsample_conv, prelu,
+    # then fusion_conv, prelu, final_1x1_conv (no prelu)
+    idx = 0
+    def next_conv():
+        nonlocal idx
+        op = ops[idx]
+        assert op[0] == 'conv'
+        idx += 1
+        return op[1], op[2]  # weights, bias
+    def next_prelu():
+        nonlocal idx
+        op = ops[idx]
+        assert op[0] == 'prelu'
+        idx += 1
+        return op[1]
 
-    conv0_kernel, conv0_bias = layers[0]['weights']
-    prelu0_alpha = layers[1]['weights'][0]
+    d1_w, d1_b = next_conv()
+    d1_a = next_prelu()
+    d2_w, d2_b = next_conv()
+    d2_a = next_prelu()
 
-    conv1_kernel, conv1_bias = layers[2]['weights']
-    prelu1_alpha = layers[3]['weights'][0]
+    c0_w, c0_b = next_conv()
+    c0_a = next_prelu()
 
-    conv2_kernel, conv2_bias = layers[4]['weights']
-    prelu2_alpha = layers[5]['weights'][0]
+    res_blocks = []
+    for _ in range(3):
+        w1, b1 = next_conv()
+        a1 = next_prelu()
+        w2, b2 = next_conv()
+        a2 = next_prelu()
+        res_blocks.append((w1, b1, a1, w2, b2, a2))
 
-    conv3_kernel, conv3_bias = layers[6]['weights']
-    prelu3_alpha = layers[7]['weights'][0]
+    up_w, up_b = next_conv()
+    up_a = next_prelu()
 
-    final_kernel, final_bias = layers[8]['weights']
+    f3_w, f3_b = next_conv()
+    f3_a = next_prelu()
 
-    print("\nGenerating shader code...")
+    final_w, final_b = next_conv()  # no prelu after
 
+    # Generate shader using previously defined functions
     parts = []
     parts.append(generate_header())
+    parts.append(generate_detail_conv_1(d1_w, d1_b, d1_a))
+    parts.append('\n' + generate_detail_conv_2(d2_w, d2_b, d2_a))
+    parts.append('\n' + generate_context_conv0(c0_w, c0_b, c0_a))
 
-    print("  - Layer conv2d (8x8 stride 2, Space-to-Depth)...")
-    parts.append(generate_first_conv_layer(conv0_kernel, conv0_bias, prelu0_alpha))
+    # Generate residual blocks with alternating storage
+    src_storage = 'storageContext0_nnaa1'
+    dst_storage = 'storageContext1_nnaa1'
+    for i, (w1, b1, a1, w2, b2, a2) in enumerate(res_blocks):
+        parts.append('\n' + generate_residual_block(i+1, w1, b1, a1, w2, b2, a2, src_storage, dst_storage))
+        src_storage, dst_storage = dst_storage, src_storage
 
-    print("  - Layer conv2d_1 (3x3 stride 1)...")
-    parts.append('\n')
-    parts.append(generate_mid_conv_layer(1, conv1_kernel, conv1_bias, prelu1_alpha))
-
-    print("  - Layer conv2d_2 (3x3 stride 1)...")
-    parts.append('\n')
-    parts.append(generate_mid_conv_layer(2, conv2_kernel, conv2_bias, prelu2_alpha))
-
-    print("  - Layer conv2d_3 (3x3 stride 1) + fused Conv2DTranspose (Depth-to-Space)...")
-    parts.append('\n')
-    parts.append(generate_mid_conv_layer(3, conv3_kernel, conv3_bias, prelu3_alpha,
-                                         is_last_hidden=True, 
-                                         final_kernel=final_kernel,
-                                         final_bias=final_bias))
-
+    parts.append('\n' + generate_upsample_conv(up_w, up_b, up_a))
+    parts.append('\n' + generate_fusion(f3_w, f3_b, f3_a, final_w, final_b))
     parts.append(generate_technique())
 
     shader_code = '\n'.join(parts)
